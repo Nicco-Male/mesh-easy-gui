@@ -1,4 +1,4 @@
-# app.py (versione base) — BLE scan con lista dispositivi + NodeDB senza refresh distruttivo
+# app.py (versione base) — BLE scan stabile + NodeDB senza refresh distruttivo
 from __future__ import annotations
 
 import asyncio
@@ -6,13 +6,12 @@ import glob
 import json
 import re
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from nicegui import ui
-
-from meshtastic.tcp_interface import TCPInterface  # type: ignore
-from meshtastic.serial_interface import SerialInterface  # type: ignore
 from meshtastic.ble_interface import BLEInterface  # type: ignore
+from meshtastic.serial_interface import SerialInterface  # type: ignore
+from meshtastic.tcp_interface import TCPInterface  # type: ignore
+from nicegui import ui
 
 AUTO = "__AUTO__"  # sentinel per select (non usare stringa vuota)
 
@@ -23,6 +22,7 @@ log_area: Optional[ui.textarea] = None
 fav_in: Optional[ui.input] = None
 ble_manual_in: Optional[ui.input] = None
 conn_status: Optional[ui.label] = None
+conn_details: Optional[ui.label] = None
 nodes_count_label: Optional[ui.label] = None
 
 row_tcp: Optional[ui.row] = None
@@ -32,24 +32,21 @@ row_ble: Optional[ui.row] = None
 serial_sel: Optional[ui.select] = None
 ble_sel: Optional[ui.select] = None
 
-ble_grid: Optional[ui.aggrid] = None
+ble_table: Optional[ui.table] = None
 nodes_grid: Optional[ui.aggrid] = None
 
 _last_nodes_sig: Optional[int] = None
 _auto_refresh_enabled: bool = False
 
 state: Dict[str, Any] = {
-    "conn_mode": "BLE",          # TCP | USB | BLE
+    "conn_mode": "BLE",  # TCP | USB | BLE
     "host": "192.168.10.8",
     "tcp_port": 4403,
-
-    "serial_port": AUTO,         # AUTO oppure /dev/ttyUSB0 ...
-    "ble_choice": AUTO,          # AUTO oppure address da scan
-    "ble_manual": "",            # MAC manuale (override)
-
+    "serial_port": AUTO,
+    "ble_choice": AUTO,
+    "ble_manual": "",
     "dest": "!a5592387",
     "favorite": "!0c3a3de4",
-
     "log": [],
 }
 
@@ -82,6 +79,21 @@ def set_status(text: str, muted: bool = False) -> None:
         conn_status.classes(remove="muted")
         if muted:
             conn_status.classes(add="muted")
+
+
+def update_connection_details() -> None:
+    if not conn_details:
+        return
+    if not iface:
+        conn_details.text = "Dettagli: localNode=no | myInfo=no | metadata=no"
+        return
+    has_local = bool(getattr(iface, "localNode", None))
+    has_myinfo = bool(getattr(iface, "myInfo", None))
+    has_meta = bool(getattr(iface, "metadata", None))
+    conn_details.text = (
+        f"Dettagli: localNode={'yes' if has_local else 'no'} | "
+        f"myInfo={'yes' if has_myinfo else 'no'} | metadata={'yes' if has_meta else 'no'}"
+    )
 
 
 def _is_hex8(s: str) -> bool:
@@ -182,21 +194,21 @@ def list_serial_ports() -> List[str]:
     ports += sorted(glob.glob("/dev/serial/by-id/*"))
     ports += sorted(glob.glob("/dev/cu.usb*"))
     ports += sorted(glob.glob("/dev/tty.usb*"))
-
     try:
         import serial.tools.list_ports  # type: ignore
+
         for p in serial.tools.list_ports.comports():
             if p.device and p.device not in ports:
                 ports.append(p.device)
     except Exception:
         pass
 
+    out: List[str] = []
     seen = set()
-    out = []
     for p in ports:
         if p not in seen:
-            out.append(p)
             seen.add(p)
+            out.append(p)
     return out
 
 
@@ -205,8 +217,7 @@ def normalize_mac(s: str) -> str:
 
 
 def looks_like_mac(s: str) -> bool:
-    s = normalize_mac(s)
-    return bool(re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", s))
+    return bool(re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", normalize_mac(s)))
 
 
 async def scan_ble_devices() -> List[Tuple[str, str, Optional[int]]]:
@@ -229,21 +240,14 @@ async def scan_ble_devices() -> List[Tuple[str, str, Optional[int]]]:
             label = f"{name} ({addr})" if name else addr
             results.append((addr, label, rssi))
 
-        # dedup per address
-        seen = set()
         uniq: List[Tuple[str, str, Optional[int]]] = []
+        seen = set()
         for addr, label, rssi in results:
             if addr not in seen:
-                uniq.append((addr, label, rssi))
                 seen.add(addr)
+                uniq.append((addr, label, rssi))
 
-        # ordina: nome prima, poi rssi più alto
-        def sort_key(x: Tuple[str, str, Optional[int]]):
-            addr, label, rssi = x
-            has_name = "(" in label and not label.startswith(addr)
-            return (0 if has_name else 1, -(rssi or -999))
-
-        uniq.sort(key=sort_key)
+        uniq.sort(key=lambda x: (0 if "(" in x[1] and not x[1].startswith(x[0]) else 1, -(x[2] or -999)))
         return uniq
     except Exception as e:
         log(f"❌ Scan BLE fallita: {e}")
@@ -269,23 +273,26 @@ def disconnect(silent: bool = False) -> None:
         if not silent:
             log("🔌 Disconnesso")
         set_status("— non connesso —", muted=True)
+        update_connection_details()
         update_nodes_grid(force=True)
     except Exception as e:
         iface = None
         _last_nodes_sig = None
         log(f"⚠️ Errore disconnect: {e}")
         set_status("— non connesso —", muted=True)
+        update_connection_details()
         update_nodes_grid(force=True)
 
 
 async def connect_async() -> None:
-    """Connessione in thread: BLE può essere lento."""
+    """Connessione in thread: BLE/USB possono essere lente."""
     global iface
     disconnect(silent=True)
     mode = state["conn_mode"]
 
     try:
         set_status("Connessione in corso…", muted=True)
+        log(f"🔌 Tentativo connessione in modalità {mode}")
 
         if mode == "TCP":
             host = str(state["host"]).strip()
@@ -306,7 +313,7 @@ async def connect_async() -> None:
             if manual:
                 if not looks_like_mac(manual):
                     log(f"❌ MAC manuale non valido: {manual}")
-                    set_status("❌ MAC manuale non valido", muted=False)
+                    set_status("❌ MAC manuale non valido")
                     iface = None
                     return
                 addr = manual
@@ -314,24 +321,33 @@ async def connect_async() -> None:
                 sel = state["ble_choice"]
                 addr = None if sel == AUTO else str(sel).strip()
 
+            log(f"📡 BLE connect verso: {addr or '(auto/paired)'}")
             iface = await asyncio.to_thread(lambda: BLEInterface(address=addr))
             log(f"✅ Connesso via BLE a {addr or '(auto/paired)'}")
             set_status(f"✅ Connesso BLE {addr or '(auto/paired)'}")
 
         else:
             log(f"❌ Modalità sconosciuta: {mode}")
-            set_status("❌ Modalità sconosciuta", muted=False)
+            set_status("❌ Modalità sconosciuta")
             iface = None
             return
 
-        # Su BLE i primi pacchetti arrivano dopo 1–3s
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.5)
+        update_connection_details()
         update_nodes_grid(force=True)
+
+        await asyncio.sleep(2.0)
+        rows = build_rows()
+        if len(rows) == 0:
+            log("⚠️ Connessione OK ma NodeDB è vuota dopo attesa: verifica pairing BLE / permessi adapter / device non Meshtastic.")
+        else:
+            log(f"📶 NodeDB disponibile: {len(rows)} nodo/i")
 
     except Exception as e:
         iface = None
         log(f"❌ Connessione fallita ({mode}): {e}")
-        set_status("❌ Connessione fallita", muted=False)
+        set_status("❌ Connessione fallita")
+        update_connection_details()
         update_nodes_grid(force=True)
 
 
@@ -349,34 +365,25 @@ def set_favorite_remote() -> None:
         log(f"❌ Set favorite fallito: {e}")
 
 
-def build_rows() -> list[dict]:
+def build_rows() -> List[Dict[str, Any]]:
     if not iface:
         return []
 
     nodes = getattr(iface, "nodes", {}) or {}
-    rows: list[dict] = []
+    rows: List[Dict[str, Any]] = []
 
     for raw_id, node in nodes.items():
         nid = format_node_id(raw_id)
         user = get_user_obj(node)
-
-        short = pick_field(user, "shortName", "short_name", "short", "shortname", default="")
-        long_ = pick_field(user, "longName", "long_name", "long", "longname", default="")
-
-        last_heard = get_node_field(node, "lastHeard", "last_heard", default=None)
-        hops = get_node_field(node, "hopsAway", "hops_away", default="")
-        role = get_node_field(node, "role", default="")
-        hw = get_node_field(node, "hwModel", "hw_model", "hardwareModel", "hardware_model", default="")
-
         rows.append(
             {
                 "id": nid,
-                "short": short,
-                "long": long_,
-                "last": human_last_heard(last_heard),
-                "hops": hops if hops is not None else "",
-                "role": str(role) if role is not None else "",
-                "hw": str(hw) if hw is not None else "",
+                "short": pick_field(user, "shortName", "short_name", "short", "shortname", default=""),
+                "long": pick_field(user, "longName", "long_name", "long", "longname", default=""),
+                "last": human_last_heard(get_node_field(node, "lastHeard", "last_heard", default=None)),
+                "hops": get_node_field(node, "hopsAway", "hops_away", default="") or "",
+                "role": str(get_node_field(node, "role", default="") or ""),
+                "hw": str(get_node_field(node, "hwModel", "hw_model", "hardwareModel", "hardware_model", default="") or ""),
             }
         )
 
@@ -391,9 +398,8 @@ def js_copy_to_clipboard(text: str) -> None:
 
 
 def update_nodes_grid(force: bool = False) -> None:
-    """Aggiorna SOLO i dati (rowData), senza ricreare la tabella => non perdi filtri/ricerche."""
+    """Aggiorna SOLO rowData della griglia nodi, senza ricrearla."""
     global _last_nodes_sig
-
     if not nodes_grid:
         return
 
@@ -405,13 +411,11 @@ def update_nodes_grid(force: bool = False) -> None:
         return
 
     rows = build_rows()
-
-    # firma leggera per evitare update inutili (che fanno flicker)
-    sig = hash(tuple((r["id"], r.get("last", ""), r.get("hops", ""), r.get("short", ""), r.get("long", "")) for r in rows))
-    if (not force) and (_last_nodes_sig == sig):
+    sig = hash(tuple((r["id"], r["short"], r["long"], r["last"], r["hops"]) for r in rows))
+    if (not force) and _last_nodes_sig == sig:
         return
-    _last_nodes_sig = sig
 
+    _last_nodes_sig = sig
     nodes_grid.options["rowData"] = rows
     nodes_grid.update()
 
@@ -420,11 +424,10 @@ def update_nodes_grid(force: bool = False) -> None:
 
 
 async def scan_ble_and_update() -> None:
-    """Popola sia la dropdown sia la LISTA dispositivi (AG Grid)"""
+    """Aggiorna select BLE + tabella dispositivi (sorgente primaria)."""
     results = await scan_ble_devices()
     log(f"🔎 BLE scan: {len(results)} device(s)")
 
-    # dropdown
     opts = {AUTO: "(auto/paired)"} | {addr: label for addr, label, _ in results}
     if ble_sel:
         ble_sel.options = opts
@@ -432,22 +435,22 @@ async def scan_ble_and_update() -> None:
             state["ble_choice"] = AUTO
             ble_sel.value = AUTO
 
-    # lista device
-    if ble_grid:
-        ble_grid.options["rowData"] = [
-            {"name": label, "addr": addr, "rssi": (rssi if rssi is not None else "")}
+    if ble_table:
+        ble_table.rows = [
+            {
+                "name": label,
+                "addr": addr,
+                "rssi": "" if rssi is None else str(rssi),
+            }
             for addr, label, rssi in results
         ]
-        ble_grid.update()
-        # su alcuni browser aiuta a “svegliarla”
-        try:
-            await ble_grid.run_grid_method("sizeColumnsToFit")
-        except Exception:
-            pass
+        ble_table.update()
 
     if results:
-        head = "\n".join([f"  - {label}" for _, label, _ in results[:10]])
-        log(f"📋 Trovati (top):\n{head}")
+        head = "\n".join([f"  - {label}" for _, label, _ in results[:8]])
+        log(f"📋 Trovati:\n{head}")
+    else:
+        log("ℹ️ Nessun device BLE trovato nello scan.")
 
 
 def refresh_serial_ports() -> None:
@@ -481,17 +484,17 @@ with ui.column().classes("page-wrap w-full"):
 
         ui.button("CONNECT", on_click=connect_async)
         ui.button("DISCONNECT", on_click=lambda: disconnect(silent=False))
-
         conn_status = ui.label("— non connesso —").classes("muted")
 
-    # TCP
+    conn_details = ui.label("Dettagli: localNode=no | myInfo=no | metadata=no").classes("muted")
+
     row_tcp = ui.row().classes("w-full items-end")
     with row_tcp:
         ui.input("Host (TCP)", value=state["host"], on_change=lambda e: state.update(host=e.value)).classes("w-72")
-        ui.number("TCP port", value=state["tcp_port"], format="%.0f",
-                  on_change=lambda e: state.update(tcp_port=int(e.value))).classes("w-40")
+        ui.number("TCP port", value=state["tcp_port"], format="%.0f", on_change=lambda e: state.update(tcp_port=int(e.value))).classes(
+            "w-40"
+        )
 
-    # USB
     row_usb = ui.row().classes("w-full items-end")
     with row_usb:
         serial_sel = ui.select(
@@ -502,7 +505,6 @@ with ui.column().classes("page-wrap w-full"):
         ).classes("w-96")
         ui.button("↻ Refresh porte", on_click=refresh_serial_ports)
 
-    # BLE
     row_ble = ui.row().classes("w-full items-end")
     with row_ble:
         ble_sel = ui.select(
@@ -520,44 +522,39 @@ with ui.column().classes("page-wrap w-full"):
             on_change=lambda e: state.update(ble_manual=e.value),
         ).classes("w-72")
 
-        ui.button(
-            "🧹 Clear MAC",
-            on_click=lambda: (state.update(ble_manual=""), setattr(ble_manual_in, "value", "")),
-        )
+        ui.button("🧹 Clear MAC", on_click=lambda: (state.update(ble_manual=""), setattr(ble_manual_in, "value", "")))
 
     set_conn_rows_visibility()
     refresh_serial_ports()
 
     ui.separator()
 
-    # Lista dispositivi BLE (sempre visibile, così non “sparisce”)
     ui.label("Lista dispositivi BLE (scan) — click riga = copia MAC nel campo manuale").classes("text-subtitle2")
-    ble_grid = ui.aggrid(
-        {
-            "defaultColDef": {"resizable": True, "sortable": True, "filter": True},
-            "columnDefs": [
-                {"headerName": "Name", "field": "name", "flex": 1, "minWidth": 280},
-                {"headerName": "Address", "field": "addr", "minWidth": 190, "maxWidth": 230, "cellClass": "mono"},
-                {"headerName": "RSSI", "field": "rssi", "minWidth": 90, "maxWidth": 110, "cellClass": "mono"},
-            ],
-            "rowData": [],
-            "rowSelection": "single",
-            "animateRows": True,
-        }
-    ).classes("ag-theme-alpine w-full").style("height: 260px;")
+    ble_table = ui.table(
+        columns=[
+            {"name": "name", "label": "Name", "field": "name", "align": "left"},
+            {"name": "addr", "label": "Address", "field": "addr", "align": "left"},
+            {"name": "rssi", "label": "RSSI", "field": "rssi", "align": "right"},
+        ],
+        rows=[],
+        row_key="addr",
+        pagination=12,
+    ).classes("w-full")
 
-    def on_ble_row_clicked(e: Any) -> None:
-        data = e.args.get("data") if isinstance(e.args, dict) else None
-        if not isinstance(data, dict):
+    def on_ble_row_click(e: Any) -> None:
+        args = e.args if isinstance(e.args, dict) else {}
+        row = args.get("row")
+        if not isinstance(row, dict):
             return
-        addr = (data.get("addr") or "").strip()
-        if addr:
-            state["ble_manual"] = addr
-            if ble_manual_in:
-                ble_manual_in.value = addr
-            log(f"📌 MAC selezionato: {addr} (incollato nel campo manuale)")
+        addr = str(row.get("addr") or "").strip()
+        if not addr:
+            return
+        state["ble_manual"] = addr
+        if ble_manual_in:
+            ble_manual_in.value = addr
+        log(f"📌 MAC selezionato: {addr} (incollato nel campo manuale)")
 
-    ble_grid.on("rowClicked", on_ble_row_clicked)
+    ble_table.on("rowClick", on_ble_row_click)
 
     ui.separator()
 
@@ -568,7 +565,6 @@ with ui.column().classes("page-wrap w-full"):
 
     ui.separator()
 
-    # Nodi: griglia creata UNA VOLTA, poi aggiorniamo solo rowData
     with ui.row().classes("w-full items-end"):
         ui.label("Nodi visibili (NodeDB locale del controllore):").classes("text-subtitle2")
         nodes_count_label = ui.label("Nodi in memoria: 0").classes("muted")
@@ -599,24 +595,35 @@ with ui.column().classes("page-wrap w-full"):
         if not isinstance(e.args, dict):
             return
         col = e.args.get("colId") or (e.args.get("colDef") or {}).get("field")
-        if col != "id":
+        if col == "id":
+            value = e.args.get("value") or (e.args.get("data") or {}).get("id")
+            if value:
+                js_copy_to_clipboard(str(value))
+
+    def on_nodes_row_clicked(e: Any) -> None:
+        data = e.args.get("data") if isinstance(e.args, dict) else None
+        if not isinstance(data, dict):
             return
-        value = e.args.get("value") or (e.args.get("data") or {}).get("id")
-        if value:
-            js_copy_to_clipboard(str(value))
+        nid = str(data.get("id") or "").strip()
+        if not nid:
+            return
+        state["favorite"] = nid
+        if fav_in:
+            fav_in.value = nid
+        log(f"➡️ Selezionato per favorite: {nid}")
 
     nodes_grid.on("cellClicked", on_nodes_cell_clicked)
+    nodes_grid.on("rowClicked", on_nodes_row_clicked)
 
     ui.separator()
     ui.label("Log:").classes("text-subtitle2")
     log_area = ui.textarea(value="", placeholder="log...").props("readonly").classes("w-full").style("height: 220px;")
 
 
-# Timer: aggiorna solo se auto-refresh ON (e senza distruggere filtri)
-def _timer_tick():
+def _timer_tick() -> None:
     if _auto_refresh_enabled and iface:
         update_nodes_grid(force=False)
 
-ui.timer(2.0, _timer_tick)
 
+ui.timer(2.0, _timer_tick)
 ui.run(port=8080)
