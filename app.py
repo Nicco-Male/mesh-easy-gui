@@ -58,6 +58,7 @@ ui.add_head_html(
       .nicegui-content { padding-top: 12px; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
       .muted { color: #6b7280; }
+      .card { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 12px; }
     </style>
     """
 )
@@ -119,6 +120,7 @@ def format_node_id(node_id: Any) -> str:
 def pick_field(obj: Any, *names: str, default: str = "") -> str:
     if obj is None:
         return default
+
     if isinstance(obj, dict):
         for n in names:
             if n in obj and obj[n] not in (None, ""):
@@ -129,16 +131,19 @@ def pick_field(obj: Any, *names: str, default: str = "") -> str:
             if k is not None and obj[k] not in (None, ""):
                 return str(obj[k])
         return default
+
     for n in names:
         if hasattr(obj, n):
             v = getattr(obj, n)
             if v not in (None, ""):
                 return str(v)
+
     d = getattr(obj, "__dict__", None)
     if isinstance(d, dict):
         for n in names:
             if n in d and d[n] not in (None, ""):
                 return str(d[n])
+
     return default
 
 
@@ -363,6 +368,7 @@ def set_favorite_remote() -> None:
 def build_rows() -> List[Dict[str, Any]]:
     if not iface:
         return []
+
     nodes = getattr(iface, "nodes", {}) or {}
     rows: List[Dict[str, Any]] = []
 
