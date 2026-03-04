@@ -42,6 +42,13 @@ serial_sel: Optional[ui.select] = None
 ble_sel: Optional[ui.select] = None
 
 
+def normalize_ble_address(value: str) -> str:
+    s = value.strip().upper()
+    if len(s) == 17 and s.count(":") == 5:
+        return s
+    return value.strip()
+
+
 ui.add_head_html(
     """
     <style>
@@ -158,6 +165,7 @@ def list_serial_ports() -> List[str]:
     ports += sorted(glob.glob("/dev/serial/by-id/*"))
     ports += sorted(glob.glob("/dev/cu.usb*"))
     ports += sorted(glob.glob("/dev/tty.usb*"))
+    ports += sorted(glob.glob("COM[0-9]*"))
     try:
         import serial.tools.list_ports  # type: ignore
         for p in serial.tools.list_ports.comports():
@@ -233,12 +241,16 @@ def connect() -> None:
         elif mode == "USB":
             sel = state["serial_port"]
             dev = None if sel == AUTO else str(sel).strip()
+            if dev == "":
+                dev = None
             iface = SerialInterface(devPath=dev)
             log(f"✅ Connesso via USB/Seriale a {dev or '(auto)'}")
 
         elif mode == "BLE":
             sel = state["ble_address"]
-            addr = None if sel == AUTO else str(sel).strip()
+            addr = None if sel == AUTO else normalize_ble_address(str(sel))
+            if addr == "":
+                addr = None
             iface = BLEInterface(address=addr)
             log(f"✅ Connesso via BLE a {addr or '(auto/paired)'}")
 
@@ -370,19 +382,32 @@ def refresh_serial_ports() -> None:
         serial_sel.options = opts
         # se value non è nelle options, reset ad AUTO
         if state["serial_port"] not in opts:
-            state["serial_port"] = AUTO
-            serial_sel.value = AUTO
+            custom = str(state["serial_port"]).strip()
+            if custom:
+                opts[custom] = f"{custom} (manuale)"
+                serial_sel.options = opts
+                serial_sel.value = custom
+            else:
+                state["serial_port"] = AUTO
+                serial_sel.value = AUTO
     log(f"🔄 Porte seriali trovate: {len(ports)}")
 
 
 async def do_ble_scan_and_update() -> None:
     results = await scan_ble_devices()
-    opts = {AUTO: "(auto/paired)"} | {addr: label for addr, label in results}
+    opts = {AUTO: "(auto/paired)"} | {normalize_ble_address(addr): label for addr, label in results}
     if ble_sel:
         ble_sel.options = opts
         if state["ble_address"] not in opts:
-            state["ble_address"] = AUTO
-            ble_sel.value = AUTO
+            custom = normalize_ble_address(str(state["ble_address"]))
+            if custom:
+                state["ble_address"] = custom
+                opts[custom] = f"{custom} (manuale)"
+                ble_sel.options = opts
+                ble_sel.value = custom
+            else:
+                state["ble_address"] = AUTO
+                ble_sel.value = AUTO
     log(f"🔎 BLE scan: {len(results)} device(s)")
 
 
@@ -418,6 +443,11 @@ with ui.column().classes("page-wrap w-full"):
             value=state["serial_port"],
             on_change=lambda e: state.update(serial_port=e.value),
         ).classes("w-96")
+        ui.input(
+            "Porta manuale (override)",
+            placeholder="es. COM7 o /dev/ttyUSB0",
+            on_change=lambda e: state.update(serial_port=e.value or AUTO),
+        ).classes("w-72")
         ui.button("↻ Refresh porte", on_click=refresh_serial_ports)
         ui.label("Se scegli (auto), prova a trovare una radio da solo").classes("muted")
 
@@ -430,6 +460,11 @@ with ui.column().classes("page-wrap w-full"):
             value=state["ble_address"],
             on_change=lambda e: state.update(ble_address=e.value),
         ).classes("w-96")
+        ui.input(
+            "MAC BLE manuale (override)",
+            placeholder="AA:BB:CC:DD:EE:FF",
+            on_change=lambda e: state.update(ble_address=normalize_ble_address(e.value) or AUTO),
+        ).classes("w-72")
         ui.button("🔎 Scan BLE", on_click=lambda: asyncio.create_task(do_ble_scan_and_update()))
         ui.label("BLE in VM/LXC può richiedere pass-through del controller").classes("muted")
 
